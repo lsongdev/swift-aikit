@@ -96,7 +96,7 @@ public class AppleIntelligenceChatClient: ChatService, @unchecked Sendable {
         _ parameters: [String: AnyCodingValue]?
     ) -> String? {
         guard let parameters else { return nil }
-        guard let data = try? JSONEncoder().encode(parameters) else { return nil }
+        guard let data = try? JSONEncoder.stableRequestEncoder.encode(parameters) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 

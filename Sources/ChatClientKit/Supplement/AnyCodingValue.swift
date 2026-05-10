@@ -14,23 +14,42 @@ public enum AnyCodingValue: Sendable, Codable {
     case array([AnyCodingValue])
     case object([String: AnyCodingValue])
 
+    private struct StringCodingKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue _: Int) { nil }
+    }
+
     public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
         switch self {
         case .null:
+            var container = encoder.singleValueContainer()
             try container.encodeNil()
         case let .bool(bool):
+            var container = encoder.singleValueContainer()
             try container.encode(bool)
         case let .int(int):
+            var container = encoder.singleValueContainer()
             try container.encode(int)
         case let .double(double):
+            var container = encoder.singleValueContainer()
             try container.encode(double)
         case let .string(string):
+            var container = encoder.singleValueContainer()
             try container.encode(string)
         case let .array(array):
+            var container = encoder.singleValueContainer()
             try container.encode(array)
         case let .object(object):
-            try container.encode(object)
+            // Encode with sorted keys so the resulting JSON is deterministic
+            // regardless of the host JSONEncoder's outputFormatting. This is
+            // required for stable prompt/tool serialization (prefix caching).
+            var container = encoder.container(keyedBy: StringCodingKey.self)
+            for key in object.keys.sorted() {
+                let value = object[key]!
+                try container.encode(value, forKey: StringCodingKey(stringValue: key))
+            }
         }
     }
 
