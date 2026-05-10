@@ -75,7 +75,6 @@ public extension ChatRequestBody {
         enum RootKey: String, CodingKey, Equatable {
             case content
             case name
-            case reasoning
             case role
             case toolCallID = "tool_call_id"
             case toolCalls = "tool_calls"
@@ -85,9 +84,13 @@ public extension ChatRequestBody {
             var container = encoder.container(keyedBy: RootKey.self)
             try container.encode(role, forKey: .role)
             switch self {
-            case let .assistant(content, toolCalls, reasoning):
+            case let .assistant(content, toolCalls, _):
+                // Reasoning is intentionally not transmitted: the OpenAI
+                // chat-completions wire schema rejects it on assistant turns,
+                // and providers like DeepSeek explicitly fail when prior
+                // reasoning is echoed back. The domain model retains it for
+                // local persistence and UI; the encoder simply drops it.
                 try container.encodeIfPresent(content, forKey: .content)
-                try container.encodeIfPresent(reasoning, forKey: .reasoning)
                 try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
             case let .developer(content, name):
                 try container.encode(content, forKey: .content)
