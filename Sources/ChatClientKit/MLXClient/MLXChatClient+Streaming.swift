@@ -11,6 +11,14 @@ import Foundation
 @preconcurrency import MLXLMCommon
 @preconcurrency import MLXVLM
 
+private struct UnsafeSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
 @available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
 extension MLXChatClient {
     func streamingChatCompletionRequestExecute(
@@ -25,18 +33,22 @@ extension MLXChatClient {
             let input = try await context.processor.prepare(input: lockedInput)
 
             let toolCallFormat = context.configuration.toolCallFormat ?? .json
+            let maxCompletionTokens = body.maxCompletionTokens ?? 4096
 
-            // Transfer values into the stream closure to avoid sending-closure data race warnings.
-            // These values are only accessed within the detached task — no concurrent use.
-            nonisolated(unsafe) let streamInput = input
-            nonisolated(unsafe) let streamContext = context
+            let streamInput = UnsafeSendableBox(input)
+            let streamContext = UnsafeSendableBox(context)
+            let streamParameters = generateParameters
+            let streamToolSpecs = toolSpecs
 
             return AsyncThrowingStream { continuation in
-                let workerTask = Task.detached(priority: .userInitiated) {
+                let workerTask = Task(priority: .userInitiated) {
                     defer { MLXChatClientQueue.shared.release(token: token) }
 
-                    let toolProcessor: ToolCallProcessor? = if let toolSpecs, !toolSpecs.isEmpty {
-                        ToolCallProcessor(format: toolCallFormat, tools: toolSpecs)
+                    let input = streamInput.value
+                    let context = streamContext.value
+
+                    let toolProcessor: ToolCallProcessor? = if let streamToolSpecs, !streamToolSpecs.isEmpty {
+                        ToolCallProcessor(format: toolCallFormat, tools: streamToolSpecs)
                     } else {
                         nil
                     }
@@ -44,17 +56,32 @@ extension MLXChatClient {
                     var latestOutputLength = 0
                     var isReasoning = false
                     var shouldRemoveLeadingWhitespace = true
-                    var decoder = ChunkDecoder(context: streamContext)
+                    var decoder = ChunkDecoder(context: context)
                     var regularContentOutputLength = 0
 
                     do {
-                        let result = try legacyGenerate(
-                            input: streamInput,
-                            parameters: generateParameters,
-                            context: streamContext
-                        ) { tokens in
+                        let (tokenStream, generationTask) = try MLXLMCommon.generateTokensTask(
+                            input: input,
+                            parameters: streamParameters,
+                            context: context
+                        )
+                        defer { generationTask.cancel() }
+
+                        var generatedTokens: [Int] = []
+                        generationLoop: for await generation in tokenStream {
+                            if Task.isCancelled {
+                                logger.debug("cancelling current inference due to Task.isCancelled")
+                                generationTask.cancel()
+                                break generationLoop
+                            }
+
+                            guard case let .token(token) = generation else {
+                                continue
+                            }
+
+                            generatedTokens.append(token)
                             let decodeResult = decoder.decode(
-                                tokens: tokens,
+                                tokens: generatedTokens,
                                 latestOutputLength: &latestOutputLength,
                                 isReasoning: &isReasoning,
                                 shouldRemoveLeadingWhitespace: &shouldRemoveLeadingWhitespace
@@ -82,20 +109,15 @@ extension MLXChatClient {
                                 }
                             }
 
-                            if decodeResult.shouldStop || regularContentOutputLength >= body.maxCompletionTokens ?? 4096 {
+                            if decodeResult.shouldStop || regularContentOutputLength >= maxCompletionTokens {
                                 logger.info("reached max completion tokens: \(regularContentOutputLength)")
-                                return .stop
+                                generationTask.cancel()
+                                break generationLoop
                             }
-
-                            if Task.isCancelled {
-                                logger.debug("cancelling current inference due to Task.isCancelled")
-                                return .stop
-                            }
-
-                            return .more
                         }
+                        await generationTask.value
 
-                        let output = result.output
+                        let output = context.tokenizer.decode(tokenIds: generatedTokens)
                         if let finalChunk = decoder.makeChunk(
                             text: output,
                             previousLength: latestOutputLength,
@@ -246,18 +268,6 @@ struct ChunkDecoder {
         let choice: ChatCompletionChunk.Choice = .init(delta: delta)
         return .init(choices: [choice])
     }
-}
-
-/// Wrapper to suppress deprecation warning. The callback-based generate API is
-/// intentionally used because the AsyncStream replacement doesn't expose individual
-/// token IDs needed by ChunkDecoder for reasoning token detection (<think>/<\/think>).
-@available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
-@available(*, deprecated, message: "intentional wrapper for deprecated MLXLMCommon.generate")
-private func legacyGenerate(
-    input: LMInput, parameters: GenerateParameters, context: ModelContext,
-    didGenerate: ([Int]) -> GenerateDisposition
-) throws -> GenerateResult {
-    try MLXLMCommon.generate(input: input, parameters: parameters, context: context, didGenerate: didGenerate)
 }
 
 @available(iOS 17.0, macOS 14.0, macCatalyst 17.0, *)
